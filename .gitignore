@@ -1,6 +1,5 @@
-.hello.ko.cmd
-.hello.mod.o.cmd
-.hello.o.cmd
+*.ko.cmd
+*.o.cmd
 .tmp_versions/
 GPATH
 GRTAGS
@@ -8,8 +7,4 @@ GTAGS
 Module.symvers
 compile.sh
 compile.sh~
-hello.ko
-hello.mod.c
-hello.mod.o
-hello.o
-modules.order
+*.ko
