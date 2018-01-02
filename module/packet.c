@@ -21,10 +21,19 @@
 #include <net/netfilter/nf_conntrack_ecache.h>
 #include <net/netfilter/nf_conntrack_helper.h>
 
+#include <linux/platform_device.h>
+#include <linux/device.h>
 #include <linux/module.h>    // included for all kernel modules
 #include <linux/kernel.h>    // included for KERN_INFO
 #include <linux/init.h>      // included for __init and __exit macros
 #include <linux/ip.h>
+#include <linux/ipv6.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
+#include <linux/dccp.h>
+#include <linux/sctp.h>
+#include <net/af_unix.h>
+
 #include <linux/filter.h>
 #include <linux/netfilter/x_tables.h>
 
@@ -43,13 +52,16 @@
 
 #define PACKET_DEBUG 1
 
-long packet_count  = 0;
+long packet_tcp_count  = 0;
+long packet_udp_count  = 0;
+long packet_unknown_count  = 0;
+
 int packet_major   = PACKET_MAJOR;
 int packet_minor   = PACKET_MINOR;
 int packet_nr_devs = PACKET_NR_DEVS;
 
-static struct cdev   packet_cdev;
-static dev_t         packet_dev_id;
+static struct cdev    packet_cdev;
+static dev_t          packet_dev_id;
 static struct class  *packet_class;
 static struct device *packet_dev;
 
@@ -101,9 +113,11 @@ static int packet_mem_proc_open(struct inode *inode,
 int packet_read_procmem(struct seq_file* s, void *v)
 {
   seq_printf(s,"device: %s\n", PACKET_DEVICE_NAME);
-  seq_printf(s,"major: %d\n",packet_major);
-  seq_printf(s,"minor: %d\n",packet_minor);
-  seq_printf(s,"packet-count: %ld\n",packet_count);
+  seq_printf(s,"major: %d\n", packet_major);
+  seq_printf(s,"minor: %d\n", packet_minor);
+  seq_printf(s,"packet-tcp-count: %ld\n", packet_tcp_count);
+  seq_printf(s,"packet-udp-count: %ld\n", packet_udp_count);
+  seq_printf(s,"packet-default-count: %ld\n", packet_unknown_count);  
   return 0;
 }
 
@@ -172,19 +186,48 @@ int an_packet_init(void)
   pr_alert("START[%ld]: Loading an/packet module !\n", an_time());
   pr_alert("misc system information:\n");  
   pr_alert("start-time: %ld \n", an_time());
-  
-  ret = alloc_chrdev_region(&packet_dev_id, PACKET_MINOR,
-                            PACKET_NR_DEVS, PACKET_DEVICE_NAME);
 
+  // Dynamically allococate device major number
+  ret = alloc_chrdev_region(&packet_dev_id,
+                            PACKET_MINOR,
+                            PACKET_NR_DEVS,
+                            PACKET_DEVICE_NAME);  
+  
   if(ret < 0) {    
     goto packet_destroy_class;
   }
   
   packet_major = MAJOR(packet_dev_id);
-  
-  pr_alert("allocated device with major number: %d\n",
+  pr_alert("Allocated device with major number: %d\n",
            packet_major);
 
+  
+  // Create charactr device
+  cdev_init(&packet_cdev, &packet_fops);
+  packet_cdev.owner = THIS_MODULE;  
+  ret = cdev_add(&packet_cdev,
+                 packet_dev_id,
+                 PACKET_NR_DEVS);
+  
+  if(ret < 0) {
+    pr_alert("unable to register device\n");
+    goto packet_failed_cdev_add;
+  }  
+
+
+  // Create sysfs entries
+  packet_class = class_create(THIS_MODULE, PACKET_DEVICE_NAME);
+  if(IS_ERR(packet_class))
+    goto packet_failed_class_create;
+
+
+  packet_dev = device_create(packet_class, NULL,
+                             packet_dev_id, NULL,
+                             PACKET_DEVICE_NAME);
+
+  if(IS_ERR(packet_dev))
+    goto packet_failed_dev_create;
+  
   nf_register_hooks(packet_filter_ops, ARRAY_SIZE(packet_filter_ops));
 
 #ifdef PACKET_DEBUG /* only when debugging */
@@ -195,7 +238,13 @@ int an_packet_init(void)
            an_time());
   
   return 0;
-  
+
+ packet_failed_dev_create:
+  class_destroy(packet_class);
+ packet_failed_class_create:
+  cdev_del(&packet_cdev);
+ packet_failed_cdev_add:
+  unregister_chrdev_region(packet_dev_id, PACKET_NR_DEVS);
  packet_destroy_class:  
   return ret;
   
@@ -204,11 +253,19 @@ int an_packet_init(void)
 void an_packet_exit(void)
 {
   pr_alert("START [%ld]: Unloading  an/packet module!\n", an_time());
+
+  //destory sysfs 
+  device_destroy(packet_class, packet_dev_id);
+  class_destroy(packet_class);
+
+  // remove char device
+  cdev_del(&packet_cdev);
   
   // unregister_chrdev_region
   unregister_chrdev_region(packet_dev_id, packet_nr_devs);
   
   nf_unregister_hooks(packet_filter_ops, ARRAY_SIZE(packet_filter_ops));
+  
 #ifdef PACKET_DEBUG /* use proc only if debugging */
 	packet_remove_proc();
 #endif
@@ -219,25 +276,46 @@ void an_packet_exit(void)
 
 loff_t
 packet_llseek(struct file *filp, loff_t off,
-              int whence){ return 0; }
+              int whence)
+{
+
+  pr_alert("packet_llseek");
+  return 0;
+}
 
 ssize_t
 packet_read(struct file *filp, char __user *buf,
-            size_t count, loff_t *f_pos){ return 0; }
+            size_t count, loff_t *f_pos)
+{
+  pr_alert("packet_read");
+  return 0;
+}
 
 ssize_t
 packet_write(struct file *filp,
              const char __user *buf,
-             size_t count, loff_t *f_pos){ return 0; }
+             size_t count, loff_t *f_pos)
+{
+  pr_alert("packet_write");
+  return 0;
+}
 
 int
 packet_open(struct inode *inode,
-            struct file *filp){ return 0; }
+            struct file *filp)
+{
+  pr_alert("packet_open");
+  return 0;
+}
 
 long
 packet_ioctl(struct file *filp,
              unsigned int cmd,
-             unsigned long arg){ return 0; }
+             unsigned long arg)
+{
+  pr_alert("packet_ioctl");
+  return 0;
+}
 
 int
 packet_release(struct inode *inode,
@@ -251,11 +329,32 @@ packet_filter_in(const struct nf_hook_ops *ops,
                  const struct net_device *out,
                  int (*okfn)(struct sk_buff *))
 {
-  const struct iphdr *iph = ip_hdr(skb);  
-  packet_count++;
+  struct udphdr *uh;
+  struct tcphdr *th;
+  const struct iphdr *iph = ip_hdr(skb);
+  switch(iph->protocol) {
+  case IPPROTO_TCP: {    
+    th = tcp_hdr(skb);
+    if (th == NULL)
+      break;
+    // th->source;
+    packet_tcp_count++;
+    break;
+  }
+  case IPPROTO_UDP: {
+    packet_udp_count++;
+    uh = udp_hdr(skb);
+    if (uh == NULL)
+      break;
+    
+    break;
+  }
+  default: 
+    packet_unknown_count++;
+  }
   return NF_ACCEPT; // always let packets pass through 
 }
 
-
 module_init(an_packet_init);
 module_exit(an_packet_exit);
+MODULE_LICENSE("GPL");
