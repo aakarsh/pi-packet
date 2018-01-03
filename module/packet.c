@@ -38,7 +38,7 @@
 #include <linux/netfilter/x_tables.h>
 
 /**
- * Simple character device which allows one to inspect 
+ * Simple character device which allows one to inspect
  * certain packets.
  */
 #define PACKET_MODULE_NAME "packet-listener"
@@ -51,6 +51,22 @@
 #define DRIVER_NAME "packet-listener"
 
 #define PACKET_DEBUG 1
+
+
+struct packet_data {
+  __be16	source;
+  __be16	dest;
+  __be32	seq;
+  __be32	ack_seq;
+};
+
+struct packet_ring {
+  long size; // fixed on creation, keep copy on all for convenience
+  long index;
+  struct packet_data  data;
+  struct packet_ring* next;
+  struct packet_ring* prev;
+};
 
 long packet_tcp_count  = 0;
 long packet_udp_count  = 0;
@@ -65,12 +81,121 @@ static dev_t          packet_dev_id;
 static struct class  *packet_class;
 static struct device *packet_dev;
 
-struct packet_listener_device {  
+// insertions always take place here.
+static struct packet_ring* packet_ring_head;
+static DEFINE_SPINLOCK(packet_ring_lock);
+
+
+struct packet_ring*
+packet_ring_create(int size)
+{
+  struct packet_ring* prev  = NULL;
+  struct packet_ring* cur   = NULL;
+  struct packet_ring* start = NULL;
+  
+  int s = size;
+  int i = index;
+  while(s-- > 0) {
+    // save current
+    prev = cur;
+    cur  = kmalloc(sizeof(struct packet_ring), GFP_KERNEL);
+
+    if(!cur)
+      goto packet_ring_alloc_error;
+
+    cur->size = size;
+    cur->index = i++;
+    
+    printk(KERN_ERR "Created packet ring index:%d ", cur->index);
+    
+    if(start == NULL)
+      start = cur;
+
+    if(prev != NULL) {
+      prev->next = cur;
+      cur->prev  = prev;
+    }    
+  }
+
+  if(cur != NULL) // set the tail to be the first element
+    cur->prev = start;
+
+  // this is a circuilar linked-list please don't traverse it infinitely
+  return start;
+
+  packet_ring_alloc_error:
+    printk(KERN_ERR "packet_ring_alloc_error!!");
+
+  return NULL;
+}
+
+
+static void
+packet_ring_free(void)
+{
+  struct packet_ring* cur;
+  struct packet_ring* next;
+    
+  spin_lock(&packet_ring_lock);  
+  int size =
+    (packet_ring_head == NULL) ? 0 : packet_ring_head->size;
+  
+  cur = packet_ring_head;
+  next = NULL;
+  
+  while(size-- > 0) {
+    if(cur == NULL)
+      break;
+    
+    next = cur->next;
+    kfree(cur);    
+    cur = next;
+  }
+  
+  packet_ring_head = NULL;
+  
+  spin_unlock(&packet_ring_lock);
+}
+
+
+void
+packet_ring_set(struct packet_ring* pr)
+{
+  spin_lock(&packet_ring_lock);
+  packet_ring_head = pr;
+  spin_unlock(&packet_ring_lock);
+}
+
+
+static void
+packet_ring_insert_tcp(const struct iphdr*  ip,
+                       const struct tcphdr* th)
+{
+  spin_lock(&packet_ring_lock);
+  
+  if(packet_ring_head == NULL)
+    goto done;
+  
+  // tcp src,tcp dest, tcp seq
+  packet_ring_head->data.source  = th->source;
+  packet_ring_head->data.dest    = th->dest;
+  packet_ring_head->data.seq     = th->seq;
+  packet_ring_head->data.ack_seq = th->ack_seq;
+  
+  packet_ring_head = packet_ring_head->next;
+
+ done:
+  spin_unlock(&packet_ring_lock);   
+}
+
+
+
+
+struct packet_listener_device {
   struct device       *dev;
   struct cdev         cdev;
   struct class *packet_class;
   struct module       *owner;
-  
 };
 
 static unsigned int
@@ -117,7 +242,7 @@ int packet_read_procmem(struct seq_file* s, void *v)
   seq_printf(s,"minor: %d\n", packet_minor);
   seq_printf(s,"packet-tcp-count: %ld\n", packet_tcp_count);
   seq_printf(s,"packet-udp-count: %ld\n", packet_udp_count);
-  seq_printf(s,"packet-default-count: %ld\n", packet_unknown_count);  
+  seq_printf(s,"packet-default-count: %ld\n", packet_unknown_count);
   return 0;
 }
 
@@ -126,6 +251,8 @@ static void packet_create_proc(void)
   proc_create_data("packet_mem", S_IRUGO,
                    NULL, &packet_mem_proc_ops, NULL);
 }
+
+
 
 static void packet_remove_proc(void)
 {
@@ -170,8 +297,8 @@ struct file_operations packet_fops = {
 };
 
 static inline long an_time(void);
-int an_packet_init(void);
-void an_packet_exit(void);
+int packet_init(void);
+void packet_exit(void);
 
 
 long an_time(void)
@@ -179,40 +306,41 @@ long an_time(void)
   return (jiffies/HZ);
 }
 
-int an_packet_init(void)
+int packet_init(void)
 {
   int ret;
-  
+
   pr_alert("START[%ld]: Loading an/packet module !\n", an_time());
-  pr_alert("misc system information:\n");  
+  pr_alert("misc system information:\n");
   pr_alert("start-time: %ld \n", an_time());
 
   // Dynamically allococate device major number
   ret = alloc_chrdev_region(&packet_dev_id,
                             PACKET_MINOR,
                             PACKET_NR_DEVS,
-                            PACKET_DEVICE_NAME);  
-  
-  if(ret < 0) {    
+                            PACKET_DEVICE_NAME);
+
+  if(ret < 0) {
     goto packet_destroy_class;
   }
-  
+
   packet_major = MAJOR(packet_dev_id);
   pr_alert("Allocated device with major number: %d\n",
            packet_major);
 
-  
+
   // Create charactr device
   cdev_init(&packet_cdev, &packet_fops);
-  packet_cdev.owner = THIS_MODULE;  
+  packet_cdev.owner = THIS_MODULE;
   ret = cdev_add(&packet_cdev,
                  packet_dev_id,
                  PACKET_NR_DEVS);
-  
+
+
   if(ret < 0) {
     pr_alert("unable to register device\n");
     goto packet_failed_cdev_add;
-  }  
+  }
 
 
   // Create sysfs entries
@@ -220,15 +348,17 @@ int an_packet_init(void)
   if(IS_ERR(packet_class))
     goto packet_failed_class_create;
 
-
-  packet_dev = device_create(packet_class, NULL,
+  packet_dev = device_create(packet_class , NULL,
                              packet_dev_id, NULL,
                              PACKET_DEVICE_NAME);
 
   if(IS_ERR(packet_dev))
     goto packet_failed_dev_create;
-  
+
   nf_register_hooks(packet_filter_ops, ARRAY_SIZE(packet_filter_ops));
+
+  packet_ring_set(packet_ring_create(100));
+
 
 #ifdef PACKET_DEBUG /* only when debugging */
   packet_create_proc();
@@ -236,7 +366,7 @@ int an_packet_init(void)
 
   pr_alert("DONE[%ld]: Loading an/packet module !\n",
            an_time());
-  
+
   return 0;
 
  packet_failed_dev_create:
@@ -245,31 +375,35 @@ int an_packet_init(void)
   cdev_del(&packet_cdev);
  packet_failed_cdev_add:
   unregister_chrdev_region(packet_dev_id, PACKET_NR_DEVS);
- packet_destroy_class:  
+ packet_destroy_class:
   return ret;
-  
+
 }
 
-void an_packet_exit(void)
+void packet_exit(void)
 {
   pr_alert("START [%ld]: Unloading  an/packet module!\n", an_time());
 
-  //destory sysfs 
+  //destory sysfs
   device_destroy(packet_class, packet_dev_id);
   class_destroy(packet_class);
 
   // remove char device
   cdev_del(&packet_cdev);
-  
+
   // unregister_chrdev_region
   unregister_chrdev_region(packet_dev_id, packet_nr_devs);
-  
+
   nf_unregister_hooks(packet_filter_ops, ARRAY_SIZE(packet_filter_ops));
-  
+
+
 #ifdef PACKET_DEBUG /* use proc only if debugging */
 	packet_remove_proc();
 #endif
         
+  // Free the packet ring
+  packet_ring_free();
+  
   pr_alert("DONE  [%ld]: Unloading  an/packet module!\n", an_time());
 }
 
@@ -333,28 +467,34 @@ packet_filter_in(const struct nf_hook_ops *ops,
   struct tcphdr *th;
   const struct iphdr *iph = ip_hdr(skb);
   switch(iph->protocol) {
-  case IPPROTO_TCP: {    
+    
+  case IPPROTO_TCP: {
     th = tcp_hdr(skb);
+    
     if (th == NULL)
-      break;
-    // th->source;
+      break;    
+  
+    packet_ring_insert_tcp(iph,th);
+
     packet_tcp_count++;
     break;
   }
+    
   case IPPROTO_UDP: {
     packet_udp_count++;
     uh = udp_hdr(skb);
     if (uh == NULL)
       break;
-    
+
     break;
   }
-  default: 
+    
+  default:
     packet_unknown_count++;
   }
-  return NF_ACCEPT; // always let packets pass through 
+  return NF_ACCEPT; // always let packets pass through
 }
 
-module_init(an_packet_init);
-module_exit(an_packet_exit);
+module_init(packet_init);
+module_exit(packet_exit);
 MODULE_LICENSE("GPL");
