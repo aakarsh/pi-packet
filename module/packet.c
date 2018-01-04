@@ -1,4 +1,5 @@
 #include <linux/moduleparam.h>
+#include <asm/atomic.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/jiffies.h>
@@ -86,9 +87,10 @@ struct packet_ring {
   struct packet_ring* prev;
 };
 
-long packet_tcp_count  = 0;
-long packet_udp_count  = 0;
-long packet_unknown_count  = 0;
+
+atomic_t packet_tcp_count      = ATOMIC_INIT(0);
+atomic_t packet_udp_count      = ATOMIC_INIT(0);
+atomic_t packet_unknown_count  = ATOMIC_INIT(0);
 
 int packet_major   = PACKET_MAJOR;
 int packet_minor   = PACKET_MINOR;
@@ -143,10 +145,10 @@ packet_ring_create(int size)
     start->prev = cur;
   }
 
-  s = 2*size; // go around twice
+  s = ( 2 * size ); // go around twice
   cur = start;
   while(s-- > 0) {
-    printk(KERN_ERR "Verifying packet at index: %ld\n", cur->size);
+    printk(KERN_ERR "Verifying packet at index: %ld\n", cur->index);
     cur = cur->next;
   }
 
@@ -159,7 +161,6 @@ packet_ring_create(int size)
   return NULL;
 }
 
-
 void
 packet_ring_seq_print(struct seq_file* s)
 {
@@ -168,33 +169,32 @@ packet_ring_seq_print(struct seq_file* s)
 
   cur = packet_ring_head;
   int size = cur->size;
-  
-  while(size-- > 0) {
+
+  while( size-- > 0 ) {
     seq_printf(s, "-[%3d]----------------------------\n",cur->index);
     // ip headers
-    seq_printf(s , "ip-tos : %d\n", cur->data.ip.tos);
+    seq_printf(s , "ip-tos : %d\n",     cur->data.ip.tos);
     seq_printf(s , "ip-tot_len : %d\n", cur->data.ip.tot_len);
-    seq_printf(s , "ip-id : %d\n", cur->data.ip.id);
-    seq_printf(s , "ip-frag_off : %d\n", cur->data.ip.frag_off);
-    seq_printf(s , "ip-ttl : %d\n", cur->data.ip.ttl);
-    seq_printf(s , "ip-protocol : %d\n", cur->data.ip.protocol);
-    seq_printf(s , "ip-check : %d\n", cur->data.ip.check);
-    seq_printf(s , "ip-saddr : %d\n", cur->data.ip.saddr);
-    seq_printf(s , "ip-daddr : %d\n", cur->data.ip.daddr);
+    seq_printf(s , "ip-id : %d\n",      cur->data.ip.id);
+    seq_printf(s , "ip-frag_off : %d\n",cur->data.ip.frag_off);
+    seq_printf(s , "ip-ttl : %d\n",     cur->data.ip.ttl);
+    seq_printf(s , "ip-protocol : %d\n",cur->data.ip.protocol);
+    seq_printf(s , "ip-check : %d\n",   cur->data.ip.check);
+    seq_printf(s , "ip-saddr : 0x%x\n",   cur->data.ip.saddr);
+    seq_printf(s , "ip-daddr : 0x%x\n",   cur->data.ip.daddr);
 
     // tcp headers
-    seq_printf(s , "tcp-src : %d\n", cur->data.tcp.source);
-    seq_printf(s , "tcp-dest: %d\n", cur->data.tcp.dest);
-    seq_printf(s , "tcp-seq : %d\n", cur->data.tcp.seq);
-    seq_printf(s , "tcp-seq : %d\n", cur->data.tcp.ack_seq);
+    seq_printf(s , "tcp-src : 0x%x\n",    cur->data.tcp.source);
+    seq_printf(s , "tcp-dest: 0x%x\n",    cur->data.tcp.dest);
+    seq_printf(s , "tcp-seq : %d\n",    cur->data.tcp.seq);
+    seq_printf(s , "tcp-seq : %d\n",    cur->data.tcp.ack_seq);
+
     seq_printf(s , "------------------------------\n");
 
     cur = cur->next;
   }
-
   spin_unlock(&packet_ring_lock);
 }
-
 
 static void
 packet_ring_free(void)
@@ -209,8 +209,8 @@ packet_ring_free(void)
   cur = packet_ring_head;
   next = NULL;
 
-  while(size-- > 0) {
-    if(cur == NULL)
+  while ( size-- > 0 ) {
+    if (cur == NULL)
       break;
 
     next = cur->next;
@@ -232,30 +232,31 @@ packet_ring_set(struct packet_ring* pr)
   spin_unlock(&packet_ring_lock);
 }
 
-
 static void
-packet_ring_insert_tcp(const struct iphdr*  ip,
-                       const struct tcphdr* th)
+packet_ring_insert_tcp(const struct sk_buff *skb,
+                       const struct iphdr   *ip,
+                       const struct tcphdr  *th)
 {
   spin_lock(&packet_ring_lock);
+
   struct packet_ring* pr = packet_ring_head;
   if(pr == NULL)
     goto done;
 
   struct packet_data* d = &(pr->data);
-  
-  // ip: { headers copy } 
-  d->ip.tos = ip->tos;
-  d->ip.tot_len = ip->tot_len;
-  d->ip.id = ip->id;
-  d->ip.frag_off = ip->frag_off;
-  d->ip.ttl = ip->ttl;
-  d->ip.protocol = ip->protocol;
-  d->ip.check = ip->check;
-  d->ip.saddr = ip->saddr;
-  d->ip.daddr = ip->daddr;
-  
-  // tcp : { src, dest, seq }
+
+  // ip:
+  d->ip.tos          = ip->tos;
+  d->ip.tot_len      = ip->tot_len;
+  d->ip.id           = ip->id;
+  d->ip.frag_off     = ip->frag_off;
+  d->ip.ttl          = ip->ttl;
+  d->ip.protocol     = ip->protocol;
+  d->ip.check        = ip->check;
+  d->ip.saddr        = ip->saddr;
+  d->ip.daddr        = ip->daddr;
+
+  // tcp : {src, dest, seq}
   d->tcp.source  = th->source;
   d->tcp.dest    = th->dest;
   d->tcp.seq     = th->seq;
@@ -267,13 +268,10 @@ packet_ring_insert_tcp(const struct iphdr*  ip,
   spin_unlock(&packet_ring_lock);
 }
 
-
-
-
 struct packet_listener_device {
   struct device       *dev;
-  struct cdev         cdev;
-  struct class *packet_class;
+  struct cdev          cdev;
+  struct class        *packet_class;
   struct module       *owner;
 };
 
@@ -303,20 +301,19 @@ packet_read_procmem(struct seq_file* s,
                     void *v);
 
 static struct file_operations packet_mem_proc_ops = {
-	.owner   = THIS_MODULE,
-	.open    = packet_mem_proc_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release
+  .owner   = THIS_MODULE,
+  .open    = packet_mem_proc_open,
+  .read    = seq_read,
+  .llseek  = seq_lseek,
+  .release = single_release
 };
 
-static int packet_mem_proc_open(struct inode *inode,
-                                struct file *file)
+static int
+packet_mem_proc_open(struct inode *inode,
+                     struct file *file)
 {
   return single_open(file, packet_read_procmem, NULL);
 }
-
-
 
 int
 packet_read_procmem(struct seq_file* s,
@@ -325,18 +322,16 @@ packet_read_procmem(struct seq_file* s,
   seq_printf(s,"device: %s\n", PACKET_DEVICE_NAME);
   seq_printf(s,"major: %d\n", packet_major);
   seq_printf(s,"minor: %d\n", packet_minor);
-  seq_printf(s,"packet-tcp-count: %ld\n", packet_tcp_count);
-  seq_printf(s,"packet-udp-count: %ld\n", packet_udp_count);
-  seq_printf(s,"packet-default-count: %ld\n", packet_unknown_count);
-
-  
-
+  seq_printf(s,"packet-tcp-count: %ld\n", atomic_read(&packet_tcp_count));
+  seq_printf(s,"packet-udp-count: %ld\n", atomic_read(&packet_udp_count));
+  seq_printf(s,"packet-default-count: %ld\n", atomic_read(&packet_unknown_count));
   packet_ring_seq_print(s);
 
   return 0;
 }
 
-static void packet_create_proc(void)
+static void
+packet_create_proc(void)
 {
   proc_create_data("packet_mem", S_IRUGO,
                    NULL, &packet_mem_proc_ops, NULL);
@@ -351,11 +346,13 @@ static void packet_remove_proc(void)
 }
 
 loff_t
-packet_llseek(struct file *filp, loff_t off,
+packet_llseek(struct file *filp,
+              loff_t off,
               int whence);
 
 ssize_t
-packet_read(struct file *filp, char __user *buf,
+packet_read(struct file *filp,
+            char __user *buf,
             size_t count, loff_t *f_pos);
 
 ssize_t
@@ -375,6 +372,7 @@ packet_ioctl(struct file *filp,
 int
 packet_release(struct inode *inode,
                struct file *filp);
+
 
 struct file_operations packet_fops = {
 	.owner =    THIS_MODULE,
@@ -565,14 +563,14 @@ packet_filter_in(const struct nf_hook_ops *ops,
     if (th == NULL)
       break;
 
-    packet_ring_insert_tcp(iph,th);
+    packet_ring_insert_tcp(skb, iph,th);
 
-    packet_tcp_count++;
+    atomic_inc(&packet_tcp_count);
     break;
   }
 
   case IPPROTO_UDP: {
-    packet_udp_count++;
+    atomic_inc(&packet_udp_count);
     uh = udp_hdr(skb);
     if (uh == NULL)
       break;
@@ -581,7 +579,7 @@ packet_filter_in(const struct nf_hook_ops *ops,
   }
 
   default:
-    packet_unknown_count++;
+    atomic_inc(&packet_unknown_count);
   }
   return NF_ACCEPT; // always let packets pass through
 }
